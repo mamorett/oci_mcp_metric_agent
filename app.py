@@ -156,8 +156,8 @@ class OCIStreamlitApp:
     - CpuUtilization: CPU usage percentage
     - MemoryUtilization: Memory usage percentage  
     - LoadAverage: System load average
-    - DiskIopsRead: Disk read IOPS
-    - DiskIopsWritten: Disk write IOPS
+    - DiskIopsRead: Disk read IOPS (rate per second)
+    - DiskIopsWritten: Disk write IOPS (rate per second)
 
     Context about the current metrics data:
     {context}
@@ -198,6 +198,82 @@ class OCIStreamlitApp:
             
         except Exception as e:
             return f"Error querying NVIDIA NIM: {e}"
+
+
+# Global helper functions for consistent IOPS handling
+def calculate_iops_rate(datapoints):
+    """Calculate IOPS rate from cumulative counter datapoints - simplified version"""
+    if not datapoints or len(datapoints) < 2:
+        return None
+    
+    try:
+        # Get the last few points to work with
+        recent_points = datapoints[-5:]  # Use last 5 points for more stability
+        
+        if len(recent_points) < 2:
+            return None
+        
+        # Find two points with valid data
+        for i in range(len(recent_points) - 1, 0, -1):
+            current = recent_points[i]
+            previous = recent_points[i-1]
+            
+            current_value = current.get("value")
+            previous_value = previous.get("value")
+            
+            if current_value is None or previous_value is None:
+                continue
+                
+            # Simple approach: assume datapoints are roughly 1 minute apart
+            # This is typical for OCI monitoring metrics
+            time_diff_minutes = 1  # Assume 1 minute intervals
+            value_diff = current_value - previous_value
+            
+            if value_diff >= 0:  # Only return if we have a positive difference
+                # Convert to per-second rate
+                return value_diff / (time_diff_minutes * 60)
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error in IOPS calculation: {e}")
+        return None
+
+def is_cumulative_metric(metric_name):
+    """Check if a metric is cumulative (counter) type"""
+    cumulative_metrics = ["DiskIopsRead", "DiskIopsWritten"]
+    return metric_name in cumulative_metrics
+
+def convert_cumulative_to_rates(datapoints):
+    """Convert cumulative datapoints to rate datapoints"""
+    if not datapoints or len(datapoints) < 2:
+        return []
+    
+    rate_datapoints = []
+    
+    for i in range(1, len(datapoints)):
+        current = datapoints[i]
+        previous = datapoints[i-1]
+        
+        current_value = current.get("value")
+        previous_value = previous.get("value")
+        
+        if current_value is None or previous_value is None:
+            continue
+        
+        # Calculate rate (assuming 1 minute intervals)
+        time_diff_minutes = 1
+        value_diff = current_value - previous_value
+        
+        if value_diff >= 0:  # Handle counter resets
+            rate = value_diff / (time_diff_minutes * 60)  # Convert to per-second
+            
+            rate_datapoints.append({
+                "timestamp": current.get("timestamp"),
+                "value": rate
+            })
+    
+    return rate_datapoints
 
 
 def main():
@@ -295,7 +371,6 @@ def main():
     st.sidebar.subheader("🤖 NVIDIA NIM Settings")
     
     # Allow users to override NIM settings
-    # nim_api_key = st.sidebar.text_input("NIM API Key", value=NIM_API_KEY, type="password")
     nim_base_url = st.sidebar.text_input("NIM Base URL", value=NIM_BASE_URL)
     nim_model = st.sidebar.selectbox("NIM Model", [
         "nvidia/llama-3.1-nemotron-nano-8b-v1",
@@ -306,8 +381,6 @@ def main():
     ], index=0)
     
     # Update app configuration
-    # if nim_api_key:
-    #     app.nim_api_key = nim_api_key
     app.nim_base_url = nim_base_url
     app.nim_model = nim_model
     
@@ -330,46 +403,6 @@ def main():
             return
         
         metrics = metrics_data.get("metrics", {})
-        
-        # Helper function to calculate rate from cumulative data
-        def calculate_iops_rate(datapoints):
-            """Calculate IOPS rate from cumulative counter datapoints - simplified version"""
-            if not datapoints or len(datapoints) < 2:
-                return None
-            
-            try:
-                # Get the last few points to work with
-                recent_points = datapoints[-5:]  # Use last 5 points for more stability
-                
-                if len(recent_points) < 2:
-                    return None
-                
-                # Find two points with valid data
-                for i in range(len(recent_points) - 1, 0, -1):
-                    current = recent_points[i]
-                    previous = recent_points[i-1]
-                    
-                    current_value = current.get("value")
-                    previous_value = previous.get("value")
-                    
-                    if current_value is None or previous_value is None:
-                        continue
-                        
-                    # Simple approach: assume datapoints are roughly 1 minute apart
-                    # This is typical for OCI monitoring metrics
-                    time_diff_minutes = 1  # Assume 1 minute intervals
-                    value_diff = current_value - previous_value
-                    
-                    if value_diff >= 0:  # Only return if we have a positive difference
-                        # Convert to per-second rate
-                        return value_diff / (time_diff_minutes * 60)
-                
-                return None
-                
-            except Exception as e:
-                print(f"Error in IOPS calculation: {e}")
-                return None
-
         
         # Create metrics grid
         col1, col2, col3 = st.columns(3)
@@ -504,39 +537,111 @@ def main():
         if detailed_data and detailed_data.get("datapoints"):
             datapoints = detailed_data["datapoints"]
             
-            # Create DataFrame for plotting
-            df = pd.DataFrame([
-                {
-                    "timestamp": datetime.datetime.fromisoformat(dp["timestamp"].replace('Z', '+00:00')),
-                    "value": dp.get("value", 0)
-                }
-                for dp in datapoints
-            ])
-            
-            # Sort by timestamp
-            df = df.sort_values('timestamp')
-            
-            # Plot the data
-            fig = px.line(df, x="timestamp", y="value", 
-                         title=f"{selected_metric} over time",
-                         labels={"value": f"{selected_metric} ({detailed_data.get('unit', '')})", "timestamp": "Time"})
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Statistics
-            st.subheader("Statistics")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Average", f"{df['value'].mean():.2f}")
-            with col2:
-                st.metric("Maximum", f"{df['value'].max():.2f}")
-            with col3:
-                st.metric("Minimum", f"{df['value'].min():.2f}")
-            with col4:
-                st.metric("Current", f"{df['value'].iloc[-1]:.2f}")
+            # Handle cumulative metrics (IOPS) differently
+            if is_cumulative_metric(selected_metric):
+                st.info(f"📊 {selected_metric} is a cumulative counter. Showing rate calculations (operations per second).")
+                
+                # Convert cumulative data to rates
+                rate_datapoints = convert_cumulative_to_rates(datapoints)
+                
+                if rate_datapoints:
+                    # Create DataFrame for plotting rates
+                    df = pd.DataFrame([
+                        {
+                            "timestamp": datetime.datetime.fromisoformat(dp["timestamp"].replace('Z', '+00:00')),
+                            "value": dp.get("value", 0)
+                        }
+                        for dp in rate_datapoints
+                    ])
+                    
+                    # Sort by timestamp
+                    df = df.sort_values('timestamp')
+                    
+                    # Plot the rate data
+                    fig = px.line(df, x="timestamp", y="value", 
+                                 title=f"{selected_metric} Rate over time",
+                                 labels={"value": f"{selected_metric} (ops/sec)", "timestamp": "Time"})
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Statistics for rates
+                    st.subheader("Rate Statistics (ops/sec)")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Average Rate", f"{df['value'].mean():.2f}")
+                    with col2:
+                        st.metric("Maximum Rate", f"{df['value'].max():.2f}")
+                    with col3:
+                        st.metric("Minimum Rate", f"{df['value'].min():.2f}")
+                    with col4:
+                        st.metric("Current Rate", f"{df['value'].iloc[-1]:.2f}")
+                    
+                    # Also show cumulative totals
+                    st.subheader("Cumulative Totals")
+                    cumulative_df = pd.DataFrame([
+                        {
+                            "timestamp": datetime.datetime.fromisoformat(dp["timestamp"].replace('Z', '+00:00')),
+                            "value": dp.get("value", 0)
+                        }
+                        for dp in datapoints
+                    ])
+                    cumulative_df = cumulative_df.sort_values('timestamp')
+                    
+                    fig_cumulative = px.line(cumulative_df, x="timestamp", y="value", 
+                                           title=f"{selected_metric} Cumulative Total over time",
+                                           labels={"value": f"{selected_metric} (total ops)", "timestamp": "Time"})
+                    st.plotly_chart(fig_cumulative, use_container_width=True)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Total Operations", f"{cumulative_df['value'].iloc[-1]:,.0f}")
+                    with col2:
+                        total_increase = cumulative_df['value'].iloc[-1] - cumulative_df['value'].iloc[0]
+                        st.metric("Operations in Period", f"{total_increase:,.0f}")
+                    
+                else:
+                    st.warning("Unable to calculate rates - insufficient data points")
+                    
+            else:
+                # Handle regular (non-cumulative) metrics
+                # Create DataFrame for plotting
+                df = pd.DataFrame([
+                    {
+                        "timestamp": datetime.datetime.fromisoformat(dp["timestamp"].replace('Z', '+00:00')),
+                        "value": dp.get("value", 0)
+                    }
+                    for dp in datapoints
+                ])
+                
+                # Sort by timestamp
+                df = df.sort_values('timestamp')
+                
+                # Plot the data
+                fig = px.line(df, x="timestamp", y="value", 
+                             title=f"{selected_metric} over time",
+                             labels={"value": f"{selected_metric} ({detailed_data.get('unit', '')})", "timestamp": "Time"})
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Statistics
+                st.subheader("Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Average", f"{df['value'].mean():.2f}")
+                with col2:
+                    st.metric("Maximum", f"{df['value'].max():.2f}")
+                with col3:
+                    st.metric("Minimum", f"{df['value'].min():.2f}")
+                with col4:
+                    st.metric("Current", f"{df['value'].iloc[-1]:.2f}")
 
             # Show raw data
             if st.checkbox("Show raw data"):
-                st.dataframe(df)
+                if is_cumulative_metric(selected_metric) and 'rate_datapoints' in locals():
+                    st.subheader("Rate Data")
+                    st.dataframe(df)
+                    st.subheader("Cumulative Data")
+                    st.dataframe(cumulative_df)
+                else:
+                    st.dataframe(df)
         else:
             st.warning(f"No data available for {selected_metric}")
     
@@ -567,9 +672,17 @@ def main():
             
             for metric_name, metric_data in metrics.items():
                 if metric_data.get("datapoints"):
-                    latest_value = metric_data["datapoints"][-1].get("value")
-                    unit = metric_data.get("unit", "")
-                    context_parts.append(f"{metric_name}: {latest_value:.2f} {unit}")
+                    if is_cumulative_metric(metric_name):
+                        # For IOPS metrics, show rate instead of cumulative
+                        rate = calculate_iops_rate(metric_data.get("datapoints", []))
+                        if rate is not None:
+                            context_parts.append(f"{metric_name}: {rate:.2f} ops/sec")
+                        else:
+                            context_parts.append(f"{metric_name}: No rate data available")
+                    else:
+                        latest_value = metric_data["datapoints"][-1].get("value")
+                        unit = metric_data.get("unit", "")
+                        context_parts.append(f"{metric_name}: {latest_value:.2f} {unit}")
                 else:
                     context_parts.append(f"{metric_name}: No data available")
             
@@ -682,14 +795,45 @@ def main():
             st.subheader("Compartment Information")
             st.write(f"**Selected Compartment ID:** {selected_compartment_id}")
             
-            # Show available metrics
+            # Show available metrics with their types
             st.subheader("Available Metrics")
             available_metrics = app.get_available_metrics()
             if available_metrics:
+                st.write("**Standard Metrics (Gauge):**")
                 for metric in available_metrics:
-                    st.write(f"• {metric}")
+                    if not is_cumulative_metric(metric):
+                        st.write(f"• {metric} - Real-time value")
+                
+                st.write("**Cumulative Metrics (Counter):**")
+                for metric in available_metrics:
+                    if is_cumulative_metric(metric):
+                        st.write(f"• {metric} - Cumulative counter (displayed as rate)")
             else:
                 st.write("Unable to fetch available metrics")
+                
+            # Metrics explanation
+            with st.expander("📖 Metrics Explanation"):
+                st.markdown("""
+                **Metric Types:**
+                
+                **Gauge Metrics** (Real-time values):
+                - **CpuUtilization**: Current CPU usage percentage
+                - **MemoryUtilization**: Current memory usage percentage  
+                - **LoadAverage**: Current system load average
+                
+                **Counter Metrics** (Cumulative totals):
+                - **DiskIopsRead**: Total disk read operations since instance start
+                - **DiskIopsWritten**: Total disk write operations since instance start
+                
+                **Note**: Counter metrics are automatically converted to rates (operations per second) 
+                for meaningful real-time monitoring. The dashboard shows both current rates and 
+                cumulative totals where applicable.
+                
+                **Data Collection**:
+                - Metrics are collected every minute by the OCI Compute Agent
+                - Historical data is available for analysis and trending
+                - Rates are calculated from consecutive data points
+                """)
         else:
             st.error("No instance information available")
     
@@ -699,6 +843,7 @@ def main():
         """
         <div style='text-align: center'>
             <p>🔧 Built with Streamlit • ☁️ Oracle Cloud Infrastructure • 🤖 NVIDIA NIM</p>
+            <p><small>Metrics updated every minute • IOPS shown as rates for real-time monitoring</small></p>
         </div>
         """, 
         unsafe_allow_html=True
