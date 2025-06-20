@@ -9,6 +9,8 @@ import plotly.graph_objects as go
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 import os
+from openai import OpenAI
+
 
 # Configuration
 load_dotenv()  # Load environment variables from .env file
@@ -138,61 +140,65 @@ class OCIStreamlitApp:
             return None
     
     def query_nvidia_nim(self, prompt: str, context: str = "") -> str:
-        """Query NVIDIA NIM with context about OCI metrics"""
+        """Query NVIDIA NIM with context about OCI metrics using OpenAI library"""
         try:
+            # Initialize OpenAI client for NVIDIA NIM
+            client = OpenAI(
+                base_url=self.nim_base_url,  # Should be "https://integrate.api.nvidia.com/v1"
+                api_key=self.nim_api_key
+            )
+            
             full_prompt = f"""
-You are an expert in Oracle Cloud Infrastructure (OCI) monitoring and compute agent metrics analysis. 
-You have access to real-time monitoring data from OCI compute instances.
+    You are an expert in Oracle Cloud Infrastructure (OCI) monitoring and compute agent metrics analysis. 
+    You have access to real-time monitoring data from OCI compute instances.
 
-The following metrics are available:
-- CpuUtilization: CPU usage percentage
-- MemoryUtilization: Memory usage percentage  
-- LoadAverage: System load average
-- DiskIopsRead: Disk read IOPS
-- DiskIopsWritten: Disk write IOPS
+    The following metrics are available:
+    - CpuUtilization: CPU usage percentage
+    - MemoryUtilization: Memory usage percentage  
+    - LoadAverage: System load average
+    - DiskIopsRead: Disk read IOPS
+    - DiskIopsWritten: Disk write IOPS
 
-Context about the current metrics data:
-{context}
+    Context about the current metrics data:
+    {context}
 
-User question: {prompt}
+    User question: {prompt}
 
-Please provide a helpful and accurate response based on the monitoring data provided.
-Focus on practical insights and recommendations for system monitoring and performance optimization.
-"""
+    Please provide a helpful and accurate response based on the monitoring data provided.
+    Focus on practical insights and recommendations for system monitoring and performance optimization.
+    """
             
-            headers = {
-                "Authorization": f"Bearer {self.nim_api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": self.nim_model,
-                "messages": [
+            completion = client.chat.completions.create(
+                model=self.nim_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "detailed thinking on"
+                    },                    
                     {
                         "role": "user",
                         "content": full_prompt
                     }
                 ],
-                "temperature": 0.7,
-                "max_tokens": 1024,
-                "stream": False
-            }
-            
-            response = requests.post(
-                f"{self.nim_base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=60
+                temperature=0.6,
+                top_p=0.7,
+                max_tokens=4096,
+                frequency_penalty=0,
+                presence_penalty=0,
+                stream=True
             )
             
-            if response.status_code == 200:
-                result = response.json()
-                return result['choices'][0]['message']['content']
-            else:
-                return f"Error querying NVIDIA NIM: {response.status_code} - {response.text}"
-                
+            # Collect streaming response
+            response_content = ""
+            for chunk in completion:
+                if chunk.choices[0].delta.content is not None:
+                    response_content += chunk.choices[0].delta.content
+            
+            return response_content
+            
         except Exception as e:
             return f"Error querying NVIDIA NIM: {e}"
+
 
 def main():
     st.set_page_config(
@@ -292,12 +298,11 @@ def main():
     # nim_api_key = st.sidebar.text_input("NIM API Key", value=NIM_API_KEY, type="password")
     nim_base_url = st.sidebar.text_input("NIM Base URL", value=NIM_BASE_URL)
     nim_model = st.sidebar.selectbox("NIM Model", [
+        "nvidia/llama-3.1-nemotron-nano-8b-v1",
         "mistralai/mistral-nemotron",
-        "meta/llama3-70b-instruct",
-        "meta/llama3-8b-instruct",
-        "microsoft/phi-3-medium-4k-instruct",
-        "mistralai/mixtral-8x7b-instruct-v0.1",
-        "google/gemma-7b"
+        "nvidia/llama-3.1-nemotron-nano-4b-v1.1",
+        "nvidia/llama-3.3-nemotron-super-49b-v1",
+        "mistralai/mixtral-8x7b-instruct-v0.1"
     ], index=0)
     
     # Update app configuration
@@ -325,6 +330,46 @@ def main():
             return
         
         metrics = metrics_data.get("metrics", {})
+        
+        # Helper function to calculate rate from cumulative data
+        def calculate_iops_rate(datapoints):
+            """Calculate IOPS rate from cumulative counter datapoints - simplified version"""
+            if not datapoints or len(datapoints) < 2:
+                return None
+            
+            try:
+                # Get the last few points to work with
+                recent_points = datapoints[-5:]  # Use last 5 points for more stability
+                
+                if len(recent_points) < 2:
+                    return None
+                
+                # Find two points with valid data
+                for i in range(len(recent_points) - 1, 0, -1):
+                    current = recent_points[i]
+                    previous = recent_points[i-1]
+                    
+                    current_value = current.get("value")
+                    previous_value = previous.get("value")
+                    
+                    if current_value is None or previous_value is None:
+                        continue
+                        
+                    # Simple approach: assume datapoints are roughly 1 minute apart
+                    # This is typical for OCI monitoring metrics
+                    time_diff_minutes = 1  # Assume 1 minute intervals
+                    value_diff = current_value - previous_value
+                    
+                    if value_diff >= 0:  # Only return if we have a positive difference
+                        # Convert to per-second rate
+                        return value_diff / (time_diff_minutes * 60)
+                
+                return None
+                
+            except Exception as e:
+                print(f"Error in IOPS calculation: {e}")
+                return None
+
         
         # Create metrics grid
         col1, col2, col3 = st.columns(3)
@@ -369,28 +414,34 @@ def main():
                 st.metric("Memory Utilization", "No data")
         
         with col3:
-            # Disk metrics
+            # Disk metrics - Calculate rates from cumulative counters
             st.subheader("💿 Disk I/O")
             disk_read_data = metrics.get("DiskIopsRead", {})
             disk_write_data = metrics.get("DiskIopsWritten", {})
             
-            disk_read = None
-            if disk_read_data.get("datapoints"):
-                disk_read = disk_read_data["datapoints"][-1].get("value")
-                
-            disk_write = None
-            if disk_write_data.get("datapoints"):
-                disk_write = disk_write_data["datapoints"][-1].get("value")
+            # Calculate current IOPS rates
+            disk_read_rate = calculate_iops_rate(disk_read_data.get("datapoints", []))
+            disk_write_rate = calculate_iops_rate(disk_write_data.get("datapoints", []))
             
-            if disk_read is not None:
-                st.metric("Disk Read IOPS", f"{disk_read:.0f}")
+            if disk_read_rate is not None:
+                st.metric("Disk Read IOPS", f"{disk_read_rate:.1f}/sec")
             else:
                 st.metric("Disk Read IOPS", "No data")
                 
-            if disk_write is not None:
-                st.metric("Disk Write IOPS", f"{disk_write:.0f}")
+            if disk_write_rate is not None:
+                st.metric("Disk Write IOPS", f"{disk_write_rate:.1f}/sec")
             else:
                 st.metric("Disk Write IOPS", "No data")
+            
+            # Optional: Show cumulative totals as well
+            if disk_read_data.get("datapoints"):
+                total_reads = disk_read_data["datapoints"][-1].get("value", 0)
+                st.caption(f"Total reads: {total_reads:,.0f}")
+            
+            if disk_write_data.get("datapoints"):
+                total_writes = disk_write_data["datapoints"][-1].get("value", 0)
+                st.caption(f"Total writes: {total_writes:,.0f}")
+
         
         # Status indicators
         st.subheader("🚦 System Health")
