@@ -289,7 +289,7 @@ def main():
     st.sidebar.subheader("🤖 NVIDIA NIM Settings")
     
     # Allow users to override NIM settings
-    nim_api_key = st.sidebar.text_input("NIM API Key", value=NIM_API_KEY, type="password")
+    # nim_api_key = st.sidebar.text_input("NIM API Key", value=NIM_API_KEY, type="password")
     nim_base_url = st.sidebar.text_input("NIM Base URL", value=NIM_BASE_URL)
     nim_model = st.sidebar.selectbox("NIM Model", [
         "mistralai/mistral-nemotron",
