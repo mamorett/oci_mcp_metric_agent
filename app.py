@@ -301,8 +301,8 @@ def main():
     ], index=0)
     
     # Update app configuration
-    if nim_api_key:
-        app.nim_api_key = nim_api_key
+    # if nim_api_key:
+    #     app.nim_api_key = nim_api_key
     app.nim_base_url = nim_base_url
     app.nim_model = nim_model
     
